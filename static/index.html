@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>多 Agent 智能问答系统</title>
+  <style>
+    :root { --blue: #2458b8; --bg: #f5f6f8; --card: #fff; --muted: #6b7280; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: var(--bg); color: #1a1a1a; }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
+    header { text-align: center; margin-bottom: 20px; }
+    header h1 { font-size: 22px; margin: 0 0 6px; color: var(--blue); }
+    header p { margin: 0; color: var(--muted); font-size: 13px; }
+    .ask-box { display: flex; gap: 8px; margin-bottom: 20px; }
+    .ask-box input { flex: 1; padding: 12px 14px; font-size: 14px; border: 1px solid #d1d5db; border-radius: 8px; outline: none; }
+    .ask-box input:focus { border-color: var(--blue); }
+    .ask-box button { padding: 12px 22px; font-size: 14px; border: none; border-radius: 8px; background: var(--blue); color: #fff; cursor: pointer; }
+    .ask-box button:disabled { opacity: .6; cursor: not-allowed; }
+    .card { background: var(--card); border-radius: 10px; padding: 18px 20px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+    .card h2 { font-size: 13px; margin: 0 0 10px; color: var(--blue); }
+    .answer { font-size: 15px; line-height: 1.7; white-space: pre-wrap; min-height: 1.2em; }
+    .answer .cursor { display: inline-block; width: 8px; height: 16px; background: var(--blue); vertical-align: text-bottom; animation: blink 1s step-start infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .tag { font-size: 12px; padding: 3px 10px; border-radius: 20px; background: #eef2fb; color: #244b9b; }
+    .tag.warn { background: #fdecec; color: #b02a2a; }
+    .tag.ok { background: #e8f6ec; color: #1d7a4d; }
+    .source { font-size: 12.5px; color: #555; padding: 6px 0; border-bottom: 1px dashed #eee; }
+    .source:last-child { border-bottom: none; }
+    .status { text-align: center; color: var(--muted); font-size: 13px; min-height: 1.2em; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>多 Agent 智能问答系统</h1>
+      <p>检索 Agent → 生成 Agent → 校验 Agent（含反思重试）｜ LangGraph + 混合检索 + RRF ｜ 流式输出</p>
+    </header>
+
+    <div class="ask-box">
+      <input id="q" placeholder="输入问题，例如：什么是混合检索？" />
+      <button id="btn" onclick="ask()">提问</button>
+    </div>
+
+    <div id="status" class="status">首次提问会先加载 embedding 模型，可能需要几十秒。</div>
+
+    <div id="result" class="hidden">
+      <div class="card">
+        <h2>答案</h2>
+        <div id="answer" class="answer"></div>
+        <div class="meta" id="meta"></div>
+      </div>
+      <div class="card">
+        <h2>参考来源（召回文档）</h2>
+        <div id="sources"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function ask() {
+      const q = document.getElementById('q').value.trim();
+      if (!q) return;
+      const btn = document.getElementById('btn');
+      const status = document.getElementById('status');
+      const result = document.getElementById('result');
+      const answerEl = document.getElementById('answer');
+      const metaEl = document.getElementById('meta');
+      const srcEl = document.getElementById('sources');
+
+      btn.disabled = true;
+      status.textContent = '正在检索与生成，请稍候…';
+      result.classList.remove('hidden');
+      answerEl.innerHTML = '<span class="cursor"></span>';
+      metaEl.innerHTML = '';
+      srcEl.innerHTML = '';
+
+      try {
+        const resp = await fetch('/api/ask/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: q }),
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          let idx;
+          while ((idx = buffer.indexOf('\n\n')) >= 0) {
+            const raw = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 2);
+            if (!raw.startsWith('data:')) continue;
+            const d = JSON.parse(raw.slice(5).trim());
+            handle(d);
+          }
+        }
+      } catch (e) {
+        status.textContent = '请求失败：' + e.message;
+        answerEl.textContent = '';
+      } finally {
+        btn.disabled = false;
+      }
+
+      function handle(d) {
+        if (d.type === 'start') {
+          status.textContent = '检索完成，开始生成…';
+          metaEl.appendChild(tag('检索查询：' + (d.queries || []).join(' | ')));
+          metaEl.appendChild(tag('召回文档：' + d.doc_count + ' 条'));
+        } else if (d.type === 'token') {
+          // 去掉末尾光标，追加 token，再加回光标
+          answerEl.innerHTML = answerEl.innerHTML.replace(/<span class="cursor"><\/span>$/, '') +
+            escapeHtml(d.content) + '<span class="cursor"></span>';
+        } else if (d.type === 'retry') {
+          status.textContent = '第一轮校验未通过，正在反思重试…（' + d.critique + '）';
+          answerEl.innerHTML = '<span class="cursor"></span>';
+          metaEl.appendChild(tag('反思重试中', 'warn'));
+        } else if (d.type === 'done') {
+          answerEl.innerHTML = answerEl.innerHTML.replace(/<span class="cursor"><\/span>$/, '');
+          status.textContent = '';
+          metaEl.appendChild(tag(d.passed ? '校验：通过' : '校验：未通过', d.passed ? 'ok' : 'warn'));
+          metaEl.appendChild(tag('反思重试：' + d.retry_rounds + ' 轮'));
+          if (d.critique) metaEl.appendChild(tag('校验反馈：' + d.critique));
+          (d.sources || []).forEach(s => {
+            const div = document.createElement('div');
+            div.className = 'source';
+            div.textContent = '[' + s.id + '] ' + s.text;
+            srcEl.appendChild(div);
+          });
+        }
+      }
+    }
+
+    function tag(text, cls) {
+      const span = document.createElement('span');
+      span.className = 'tag' + (cls ? ' ' + cls : '');
+      span.textContent = text;
+      return span;
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    document.getElementById('q').addEventListener('keydown', e => {
+      if (e.key === 'Enter') ask();
+    });
+  </script>
+</body>
+</html>
